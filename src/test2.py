@@ -4,15 +4,25 @@ import yfinance as yf
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import time
+import scikeras as scikeras
 from sklearn.preprocessing import MinMaxScaler
-from keras.layers import LSTM, Dense
-from keras.models import Sequential
-from keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+from tensorflow import keras
+from keras._tf_keras.keras.layers import LSTM, Dense, Dropout, InputLayer
+from keras._tf_keras.keras.models import Sequential
+from keras._tf_keras.keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras._tf_keras.keras.regularizers import l1_l2
+from keras._tf_keras.keras.optimizers import Adam
+from scikeras.wrappers import KerasClassifier, KerasRegressor
+from sklearn.model_selection import GridSearchCV
 from statsmodels.tsa.seasonal import seasonal_decompose
+
 
 # Forçar o TensorFlow a usar a CPU
 tf.config.set_visible_devices([], 'GPU')
 print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+
 
 def add_exogenous_variables(data, variables):
     for var in variables:
@@ -20,6 +30,15 @@ def add_exogenous_variables(data, variables):
             data['PIB'] = np.random.normal(loc=10000, scale=100, size=len(data))
         elif var == 'Cambio':
             data['Cambio'] = np.random.normal(loc=5, scale=0.1, size=len(data))
+    return data
+
+def remove_outliers(data, column):
+    q1 = data[column].quantile(0.25)
+    q3 = data[column].quantile(0.75)
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    data = data[(data[column] >= lower_bound) & (data[column] <= upper_bound)]
     return data
 
 def create_dataset(dataset, look_back):
@@ -30,25 +49,56 @@ def create_dataset(dataset, look_back):
         Y.append(dataset[i + look_back, 0])
     return np.array(X), np.array(Y)
 
-def build_model(input_shape):
+def build_model(optimizer='adam', neurons=50, dropout_rate=0.2, l2_reg=0.01):
     model = Sequential()
-    model.add(LSTM(10, input_shape=input_shape))
+    model.add(InputLayer(shape=(look_back, 6)))
+    model.add(LSTM(neurons, return_sequences=True, kernel_regularizer=l1_l2(l1=0.01, l2=l2_reg)))
+    model.add(Dropout(dropout_rate))
+    model.add(LSTM(neurons, kernel_regularizer=l1_l2(l1=0.01, l2=l2_reg)))
+    model.add(Dropout(dropout_rate))
     model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mean_squared_error')
+    model.compile(optimizer=optimizer, loss='mean_squared_error')
     return model
+
+def perform_grid_search(X_train, y_train):
+    model = KerasRegressor(model=build_model, verbose=0, neurons=50, dropout_rate=0.2, l2_reg=0.01)
+    param_grid = {
+        'batch_size': [16, 32],
+        'epochs': [50, 100],
+        'optimizer': ['adam', 'nadam'],
+        'neurons': [50, 100],
+        'dropout_rate': [0.2, 0.3],
+        'l2_reg': [0.01, 0.02]
+    }
+    grid = GridSearchCV(estimator=model, param_grid=param_grid, n_jobs=-1, cv=3)
+    grid_result = grid.fit(X_train, y_train)
+    return grid_result.best_params_
 
 def train_and_predict(ticker, variables, look_back):
     today = pd.Timestamp.now()
-    start_date = today - pd.DateOffset(months=6)
+    start_date = today - pd.DateOffset(years=1)
     data = yf.download(ticker, start=start_date, end=today)['Close']
     data = data.dropna()
 
     if isinstance(data, pd.Series):
         data = data.to_frame()
 
+    # Adicionar variáveis exógenas
     data = add_exogenous_variables(data, variables)
+
+    # Remover valores ausentes e infinidades
     data = data.dropna()
     data = data[~data.isin([np.inf, -np.inf]).any(axis=1)]
+
+    # Remover outliers
+    data = remove_outliers(data, 'Close')
+
+    # Decomposição sazonal
+    decomposition = seasonal_decompose(data['Close'], model='multiplicative', period=30)
+    data['trend'] = decomposition.trend
+    data['seasonal'] = decomposition.seasonal
+    data['resid'] = decomposition.resid
+    data = data.dropna()
 
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled_data = scaler.fit_transform(data)
@@ -65,18 +115,34 @@ def train_and_predict(ticker, variables, look_back):
 
     X = np.reshape(X, (X.shape[0], X.shape[1], X.shape[2]))
 
-    model = build_model((X.shape[1], X.shape[2]))
+    # Dividindo os dados em conjunto de treino e validação
+    tscv = TimeSeriesSplit(n_splits=5)
+    train_index, val_index = list(tscv.split(X))[-1]
+    X_train, X_val = X[train_index], X[val_index]
+    y_train, y_val = y[train_index], y[val_index]
 
-    early_stopping = EarlyStopping(monitor='loss', patience=3, verbose=1)
-    checkpoint = ModelCheckpoint("best_model.keras", save_best_only=True, monitor='loss', mode='min')
+    # Busca em Grade para Hiperparâmetros
+    best_params = perform_grid_search(X_train, y_train)
+    print(f"Melhores parâmetros encontrados: {best_params}")
+
+    model = build_model(
+        optimizer=best_params['optimizer'],
+        neurons=best_params['neurons'],
+        dropout_rate=best_params['dropout_rate'],
+        l2_reg=best_params['l2_reg']
+    )
+
+    early_stopping = EarlyStopping(monitor='val_loss', patience=5, verbose=1)
+    checkpoint = ModelCheckpoint("best_model.keras", save_best_only=True, monitor='val_loss', mode='min')
 
     print("Iniciando treinamento do modelo...")
     start_time = time.time()
-    history = model.fit(X, y, epochs=5, batch_size=32, verbose=2, callbacks=[early_stopping, checkpoint])
+    history = model.fit(X_train, y_train, epochs=best_params['epochs'], batch_size=best_params['batch_size'], verbose=2,
+                        validation_data=(X_val, y_val), callbacks=[early_stopping, checkpoint])
     end_time = time.time()
     print(f"Tempo de treinamento: {end_time - start_time} segundos")
 
-    model.summary()
+    model.load_weights("best_model.keras")
 
     predictions = model.predict(X)
     predictions = scaler.inverse_transform(np.column_stack((predictions, np.zeros((predictions.shape[0], data.shape[1] - 1)))))
@@ -89,8 +155,10 @@ def train_and_predict(ticker, variables, look_back):
 
     for _ in range(num_days):
         next_prediction = model.predict(last_samples)
+        next_prediction_full = np.zeros((1, next_prediction.shape[0], last_samples.shape[2]))
+        next_prediction_full[:, :, 0] = next_prediction
         future_predictions.append(next_prediction[0])
-        next_input = np.concatenate((last_samples[:, 1:, :], next_prediction.reshape(1, 1, -1)), axis=1)
+        next_input = np.concatenate((last_samples[:, 1:, :], next_prediction_full), axis=1)
         last_samples = next_input
 
     future_predictions = np.array(future_predictions)
